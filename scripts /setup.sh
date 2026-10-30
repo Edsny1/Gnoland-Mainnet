@@ -78,6 +78,8 @@ main_menu() {
         echo "  [5] Add / Update description"
         echo "  [6] Register validator candidate"
         echo "  [7] Service management"
+        echo "  [8] Update node (build + wait for halt height)"
+        echo "  [9] Update watcher status / logs"
         echo "  [0] Exit"
         echo ""
         read -rp "  Choose an option: " choice
@@ -90,6 +92,8 @@ main_menu() {
             5) update_description ;;
             6) register_validator ;;
             7) service_menu ;;
+            8) update_node ;;
+            9) update_watcher_status ;;
             0) echo ""; exit 0 ;;
             *) warn "Invalid option, try again."; sleep 1 ;;
         esac
@@ -808,6 +812,576 @@ service_menu() {
             *) warn "Invalid option."; sleep 1 ;;
         esac
     done
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. BUILD AND SCHEDULE A COORDINATED MAINNET UPDATE
+# ══════════════════════════════════════════════════════════════════════════════
+update_node() {
+    banner
+    echo -e "  ${BOLD}[8] Build and Schedule Node Update${NC}\n"
+    echo "  Enter BOTH values from the official upgrade announcement:"
+    echo "  - Release version, for example: 1.7.0"
+    echo "  - Exact mainnet halt block height, for example: 1183000"
+    echo ""
+    warn "The height is deliberately manual. It is never guessed from the version."
+    echo ""
+
+    require_cmd git
+    require_cmd make
+    require_cmd go
+    require_cmd curl
+    require_cmd python3
+
+    local SERVICE="gnoland-mainnet"
+    local NODE_GNO_DIR NODE_GNOROOT SERVICE_ENV
+    NODE_GNO_DIR="$(sudo systemctl show -p WorkingDirectory --value "$SERVICE")"
+    NODE_GNO_DIR="${NODE_GNO_DIR:-$GNO_DIR}"
+
+    # gnoland initializes gnoenv even for `version`; inherit the exact GNOROOT
+    # configured for the live systemd service. Fall back to WorkingDirectory,
+    # which is the repository root in this install layout.
+    SERVICE_ENV="$(sudo systemctl show -p Environment --value "$SERVICE" 2>/dev/null || true)"
+    NODE_GNOROOT="$(printf '%s\n' "$SERVICE_ENV" | tr ' ' '\n' | sed -n 's/^GNOROOT=//p' | head -n 1)"
+    NODE_GNOROOT="${NODE_GNOROOT:-$NODE_GNO_DIR}"
+    if [[ ! -d "$NODE_GNOROOT" ]]; then
+        error "GNOROOT directory does not exist: $NODE_GNOROOT"
+        press_enter
+        return
+    fi
+    export GNOROOT="$NODE_GNOROOT"
+
+    local CONFIG_FILE="$NODE_GNO_DIR/gnoland-data/config/config.toml"
+    local WATCHER_UNIT="gnoland-mainnet-upgrade-watcher.service"
+    local WATCHER_SCRIPT="/usr/local/sbin/gnoland-mainnet-upgrade-watcher"
+    local WATCHER_CONFIG="/etc/gnoland-mainnet-upgrade.conf"
+
+    if ! sudo systemctl cat "$SERVICE" >/dev/null 2>&1; then
+        error "systemd service '$SERVICE' was not found."
+        press_enter
+        return
+    fi
+
+    if ! sudo systemctl is-active --quiet "$SERVICE"; then
+        error "The node service must be running before scheduling an update."
+        press_enter
+        return
+    fi
+
+    if sudo systemctl is-active --quiet "$WATCHER_UNIT"; then
+        warn "An update watcher is already active."
+        echo "  Check: sudo journalctl -u $WATCHER_UNIT -f"
+        press_enter
+        return
+    fi
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        error "Config file not found: $CONFIG_FILE"
+        press_enter
+        return
+    fi
+
+    # Resolve the exact executable used by the systemd service.
+    local EXECSTART GNOLAND_BIN GNOKEY_BIN SERVICE_USER SERVICE_GROUP
+    EXECSTART="$(sudo systemctl show -p ExecStart --value "$SERVICE")"
+    GNOLAND_BIN="$(printf '%s\n' "$EXECSTART" | sed -n 's/.*path=\([^ ;}]*\).*/\1/p')"
+    if [[ -z "$GNOLAND_BIN" ]]; then
+        GNOLAND_BIN="$(gnoland_bin)"
+    fi
+    if [[ ! -x "$GNOLAND_BIN" ]]; then
+        error "Could not locate the gnoland executable used by systemd: $GNOLAND_BIN"
+        press_enter
+        return
+    fi
+
+    GNOKEY_BIN="$(dirname "$GNOLAND_BIN")/gnokey"
+    if [[ ! -x "$GNOKEY_BIN" ]]; then
+        error "Matching gnokey executable not found: $GNOKEY_BIN"
+        press_enter
+        return
+    fi
+
+    SERVICE_USER="$(sudo systemctl show -p User --value "$SERVICE")"
+    SERVICE_USER="${SERVICE_USER:-root}"
+    SERVICE_GROUP="$(id -gn "$SERVICE_USER" 2>/dev/null || echo "$SERVICE_USER")"
+
+    # Read the actual local RPC port from config.toml.
+    local RPC_PORT
+    RPC_PORT="$(python3 - "$CONFIG_FILE" <<'PYRPC'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+section = re.search(r"(?ms)^\[rpc\]\s*(.*?)(?=^\s*\[|\Z)", text)
+if not section:
+    raise SystemExit("[rpc] section not found")
+match = re.search(r'(?m)^\s*laddr\s*=\s*"tcp://[^\"]*:(\d+)"', section.group(1))
+if not match:
+    raise SystemExit("rpc.laddr port not found")
+print(match.group(1))
+PYRPC
+)" || {
+        error "Could not determine RPC port from config.toml."
+        press_enter
+        return
+    }
+
+    # Governance-driven upgrades require config halt_height to remain zero.
+    local CONFIG_HALT
+    CONFIG_HALT="$(python3 - "$CONFIG_FILE" <<'PYHALT'
+import re, sys
+value = "0"
+for raw in open(sys.argv[1], encoding="utf-8"):
+    line = raw.split("#", 1)[0].strip()
+    match = re.match(r"^halt_height\s*=\s*(\d+)\s*$", line)
+    if match:
+        value = match.group(1)
+        break
+print(value)
+PYHALT
+)"
+    if [[ "$CONFIG_HALT" != "0" ]]; then
+        error "config.toml has halt_height=$CONFIG_HALT. For a governance halt this must be 0."
+        error "Do not mix a local config halt with the on-chain governance halt."
+        press_enter
+        return
+    fi
+
+    local CURRENT_VERSION
+    CURRENT_VERSION="$(GNOROOT="$NODE_GNOROOT" "$GNOLAND_BIN" version 2>&1 || true)"
+    echo "  Current binary : $CURRENT_VERSION"
+    echo "  RPC endpoint   : http://127.0.0.1:$RPC_PORT/status"
+    echo "  Service user   : $SERVICE_USER"
+    echo ""
+
+    local TARGET_VERSION TARGET_HEIGHT
+    read -rp "  Target version (e.g. 1.7.0): " TARGET_VERSION
+    TARGET_VERSION="${TARGET_VERSION#v}"
+    if [[ ! "$TARGET_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        error "Invalid version. Use MAJOR.MINOR.PATCH, e.g. 1.7.0"
+        press_enter
+        return
+    fi
+    TARGET_VERSION="v$TARGET_VERSION"
+
+    read -rp "  Exact mainnet halt block height: " TARGET_HEIGHT
+    if [[ ! "$TARGET_HEIGHT" =~ ^[1-9][0-9]*$ ]]; then
+        error "Invalid block height. Enter a positive integer without separators."
+        press_enter
+        return
+    fi
+
+    # Verify local RPC and ensure the requested halt is still ahead (or exactly reached).
+    local INITIAL_STATUS INITIAL_CHAIN INITIAL_HEIGHT INITIAL_CATCHING
+    INITIAL_STATUS="$(curl -fsS --max-time 10 "http://127.0.0.1:${RPC_PORT}/status" 2>/dev/null || true)"
+    if [[ -z "$INITIAL_STATUS" ]]; then
+        error "Local RPC is not responding. Update has not been scheduled."
+        press_enter
+        return
+    fi
+
+    INITIAL_CHAIN="$(printf '%s' "$INITIAL_STATUS" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["node_info"]["network"])' 2>/dev/null || true)"
+    INITIAL_HEIGHT="$(printf '%s' "$INITIAL_STATUS" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["sync_info"]["latest_block_height"])' 2>/dev/null || true)"
+    INITIAL_CATCHING="$(printf '%s' "$INITIAL_STATUS" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["sync_info"]["catching_up"])' 2>/dev/null || true)"
+    if [[ "$INITIAL_CHAIN" != "$CHAIN_ID" || ! "$INITIAL_HEIGHT" =~ ^[0-9]+$ ]]; then
+        error "Local RPC chain/height check failed. Chain=$INITIAL_CHAIN Height=$INITIAL_HEIGHT"
+        press_enter
+        return
+    fi
+    if [[ "$INITIAL_CATCHING" != "False" ]]; then
+        error "The node is still catching up. Wait until it is fully synced, then schedule the update."
+        press_enter
+        return
+    fi
+    if (( INITIAL_HEIGHT > TARGET_HEIGHT )); then
+        error "Your node is already at height $INITIAL_HEIGHT, above the entered halt $TARGET_HEIGHT."
+        error "No binary will be changed. Re-check the official halt height."
+        press_enter
+        return
+    fi
+
+    echo ""
+    echo "  ─── Update plan ─────────────────────────────────────────"
+    echo "  Chain          : $CHAIN_ID"
+    echo "  Version        : $TARGET_VERSION"
+    echo "  Target halt    : $TARGET_HEIGHT"
+    echo "  Current height : $INITIAL_HEIGHT"
+    echo "  Poll interval  : 15 seconds"
+    echo "  Stability rule : 5 consecutive identical readings"
+    echo "  On-chain check : halt_height + halt_min_version must match"
+    echo "  RPC monitoring : local RPC + official public RPC fallback"
+    echo "  Node action    : keep running until halt, then restart"
+    echo "  ─────────────────────────────────────────────────────────"
+    echo ""
+    warn "The node will continue using its current binary while the new version is built."
+    warn "After build, a root-owned systemd watcher waits for the exact height."
+    read -rp "  Continue? [y/N]: " CONFIRM
+    [[ "$CONFIRM" =~ ^[Yy]$ ]] || { info "Cancelled."; press_enter; return; }
+
+    # Build in a separate checkout; never switch or modify the live repository.
+    local STAMP BUILD_ROOT BUILD_DIR SOURCE_DIR BIN_DIR
+    STAMP="$(date +%Y%m%d-%H%M%S)"
+    BUILD_ROOT="$HOME/.cache/gnoland-mainnet-updates"
+    BUILD_DIR="$BUILD_ROOT/${TARGET_VERSION}-${STAMP}"
+    SOURCE_DIR="$BUILD_DIR/source"
+    BIN_DIR="$BUILD_DIR/bin"
+    mkdir -p "$SOURCE_DIR" "$BIN_DIR"
+
+    info "Checking that tag $TARGET_VERSION exists on the official repository..."
+    if ! git ls-remote --exit-code --tags https://github.com/gnolang/gno.git "refs/tags/$TARGET_VERSION" >/dev/null 2>&1; then
+        error "Tag $TARGET_VERSION was not found on https://github.com/gnolang/gno"
+        press_enter
+        return
+    fi
+
+    info "Cloning $TARGET_VERSION into an isolated build directory..."
+    if ! git clone --depth 1 --branch "$TARGET_VERSION" --single-branch \
+        https://github.com/gnolang/gno.git "$SOURCE_DIR"; then
+        error "Git clone failed. Existing node and binary are untouched."
+        press_enter
+        return
+    fi
+
+    info "Building gnoland and gnokey. Go toolchain auto-download is enabled; global Go is not replaced..."
+    if ! (cd "$SOURCE_DIR" && \
+        CGO_ENABLED=0 GOTOOLCHAIN=auto GOBIN="$BIN_DIR" make -C gno.land \
+            VERSION="$TARGET_VERSION" install.gnoland install.gnokey); then
+        error "Build failed. Existing node and binary are untouched."
+        echo "  Build directory: $BUILD_DIR"
+        press_enter
+        return
+    fi
+
+    if [[ ! -x "$BIN_DIR/gnoland" || ! -x "$BIN_DIR/gnokey" ]]; then
+        error "Build output is incomplete. Existing node and binary are untouched."
+        press_enter
+        return
+    fi
+
+    local BUILT_GNOLAND_VERSION BUILT_GNOKEY_VERSION
+    BUILT_GNOLAND_VERSION="$(GNOROOT="$NODE_GNOROOT" "$BIN_DIR/gnoland" version 2>&1 || true)"
+    BUILT_GNOKEY_VERSION="$("$BIN_DIR/gnokey" version 2>&1 || true)"
+    echo "  Built gnoland: $BUILT_GNOLAND_VERSION"
+    echo "  Built gnokey : $BUILT_GNOKEY_VERSION"
+    if [[ "$BUILT_GNOLAND_VERSION" != *"$TARGET_VERSION"* || "$BUILT_GNOKEY_VERSION" != *"$TARGET_VERSION"* ]]; then
+        error "The compiled binaries do not report $TARGET_VERSION. Not scheduling update."
+        press_enter
+        return
+    fi
+
+    # Copy verified artifacts to root-owned storage so the watcher can safely
+    # survive logout/reboot and install only these exact binaries.
+    local STAGED_ROOT BACKUP_DIR
+    STAGED_ROOT="/var/lib/gnoland-mainnet-updates/${TARGET_VERSION}-${STAMP}"
+    BACKUP_DIR="$NODE_GNO_DIR/backups/${TARGET_VERSION}-${STAMP}"
+    sudo install -d -o root -g root -m 0755 "$STAGED_ROOT"
+    sudo install -o root -g root -m 0755 "$BIN_DIR/gnoland" "$STAGED_ROOT/gnoland"
+    sudo install -o root -g root -m 0755 "$BIN_DIR/gnokey" "$STAGED_ROOT/gnokey"
+
+    # Write root-readable watcher settings as shell-escaped assignments.
+    {
+        printf 'SERVICE_NAME=%q\n' "$SERVICE"
+        printf 'SERVICE_USER=%q\n' "$SERVICE_USER"
+        printf 'SERVICE_GROUP=%q\n' "$SERVICE_GROUP"
+        printf 'TARGET_VERSION=%q\n' "$TARGET_VERSION"
+        printf 'TARGET_HEIGHT=%q\n' "$TARGET_HEIGHT"
+        printf 'CHECK_INTERVAL=%q\n' "15"
+        printf 'RPC_URL=%q\n' "http://127.0.0.1:${RPC_PORT}/status"
+        printf 'FALLBACK_RPC_URL=%q\n' "https://rpc.gno.land/status"
+        printf 'GOVERNANCE_RPC_URL=%q\n' "https://rpc.gno.land"
+        printf 'GNOROOT=%q\n' "$NODE_GNOROOT"
+        printf 'GNOLAND_BIN=%q\n' "$GNOLAND_BIN"
+        printf 'GNOKEY_BIN=%q\n' "$GNOKEY_BIN"
+        printf 'STAGED_GNOLAND=%q\n' "$STAGED_ROOT/gnoland"
+        printf 'STAGED_GNOKEY=%q\n' "$STAGED_ROOT/gnokey"
+        printf 'BACKUP_DIR=%q\n' "$BACKUP_DIR"
+        printf 'WATCHER_UNIT=%q\n' "$WATCHER_UNIT"
+    } | sudo tee "$WATCHER_CONFIG" >/dev/null
+    sudo chmod 0600 "$WATCHER_CONFIG"
+
+    # Root-owned watcher: it monitors local RPC and falls back to official public RPC.
+    sudo tee "$WATCHER_SCRIPT" >/dev/null <<'WATCHER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG="/etc/gnoland-mainnet-upgrade.conf"
+[[ -r "$CONFIG" ]] || { echo "[ERROR] Missing $CONFIG"; exit 1; }
+# shellcheck disable=SC1090
+source "$CONFIG"
+# gnoland/gnokey may consult gnoenv even for simple commands.
+export GNOROOT
+
+log() { echo "[$(date '+%F %T')] $*"; }
+stop_watcher_on_error() {
+    systemctl disable "$WATCHER_UNIT" >/dev/null 2>&1 || true
+}
+fail() {
+    log "ERROR: $*"
+    stop_watcher_on_error
+    exit 1
+}
+
+rpc_fields_from() {
+    local endpoint="$1" raw
+    raw="$(curl -fsS --connect-timeout 3 --max-time 8 "$endpoint" 2>/dev/null)" || return 1
+    printf '%s' "$raw" | python3 -c '
+import json,sys
+r=json.load(sys.stdin)["result"]
+s=r["sync_info"]
+n=r["node_info"]
+print("\t".join([
+    str(n.get("network", "")),
+    str(s.get("latest_block_height", "")),
+    str(s.get("catching_up", "")),
+    str(r.get("build_version", "")),
+]))
+' 2>/dev/null
+}
+
+# Prefer the local RPC; fall back to the official endpoint if the old binary
+# exits at the governance halt and can no longer serve local RPC requests.
+rpc_fields() {
+    local fields
+    if fields="$(rpc_fields_from "$RPC_URL" 2>/dev/null)" && [[ -n "$fields" ]]; then
+        printf '%s\n' "$fields"
+        return 0
+    fi
+    if fields="$(rpc_fields_from "$FALLBACK_RPC_URL" 2>/dev/null)" && [[ -n "$fields" ]]; then
+        printf '%s\n' "$fields"
+        return 0
+    fi
+    return 1
+}
+
+# These on-chain values are authoritative. The manually entered version and
+# height must agree with the governance proposal before the node is restarted.
+query_data_value() {
+    local query_path="$1" output
+    output="$("$STAGED_GNOKEY" query "$query_path" -remote "$GOVERNANCE_RPC_URL" 2>&1)" || return 1
+    printf '%s\n' "$output" | sed -n 's/^[[:space:]]*data:[[:space:]]*//p' | head -n 1 | tr -d '"()' | awk '{print $1}'
+}
+
+verify_governance_halt() {
+    local onchain_height onchain_version
+    onchain_height="$(query_data_value 'params/node:p:halt_height' || true)"
+    onchain_version="$(query_data_value 'params/node:p:halt_min_version' || true)"
+
+    if [[ "$onchain_height" =~ ^[0-9]+$ ]] && (( onchain_height > 0 )); then
+        if [[ "$onchain_height" != "$TARGET_HEIGHT" ]]; then
+            fail "Manual halt height $TARGET_HEIGHT does not match on-chain governance halt $onchain_height. No binary changed."
+        fi
+        if [[ "$onchain_version" != "$TARGET_VERSION" ]]; then
+            fail "Manual version $TARGET_VERSION does not match on-chain halt_min_version '$onchain_version'. No binary changed."
+        fi
+        return 0
+    fi
+    return 1
+}
+
+log "Watcher started. Target=$TARGET_VERSION halt_height=$TARGET_HEIGHT local_RPC=$RPC_URL fallback_RPC=$FALLBACK_RPC_URL"
+log "The node remains on its existing binary until the exact halt height is stable."
+
+LAST_HEIGHT=""
+STABLE_COUNT=0
+LOOP_COUNT=0
+
+GOVERNANCE_CONFIRM_COUNT=0
+
+while true; do
+    RPC_SOURCE="local"
+    FIELDS="$(rpc_fields_from "$RPC_URL" 2>/dev/null || true)"
+    if [[ -z "$FIELDS" ]]; then
+        RPC_SOURCE="official-fallback"
+        FIELDS="$(rpc_fields_from "$FALLBACK_RPC_URL" 2>/dev/null || true)"
+    fi
+    if [[ -z "$FIELDS" ]]; then
+        STABLE_COUNT=0
+        LAST_HEIGHT=""
+        log "Local and official fallback RPC are unavailable; retrying."
+        sleep "$CHECK_INTERVAL"
+        continue
+    fi
+
+    if [[ "$RPC_SOURCE" == "official-fallback" ]] && ! systemctl is-active --quiet "$SERVICE_NAME"; then
+        log "Node service is stopped/restarting; monitoring the official RPC fallback."
+    fi
+
+    IFS=$'\t' read -r CHAIN HEIGHT CATCHING_UP BUILD_VERSION <<< "$FIELDS"
+    if [[ "$CHAIN" != "gnoland-1" ]]; then
+        fail "RPC returned unexpected chain ID '$CHAIN'. No restart performed."
+    fi
+    if [[ ! "$HEIGHT" =~ ^[0-9]+$ ]]; then
+        STABLE_COUNT=0
+        LAST_HEIGHT=""
+        log "RPC returned an invalid height '$HEIGHT'; retrying."
+        sleep "$CHECK_INTERVAL"
+        continue
+    fi
+
+    # Before the halt, periodically validate the manually entered values.
+    # At/after the halt, governance must confirm the exact version and height.
+    if (( LOOP_COUNT % 4 == 0 )) || (( HEIGHT >= TARGET_HEIGHT )); then
+        if (( HEIGHT >= TARGET_HEIGHT )); then
+            verify_governance_halt || fail "Could not confirm on-chain halt_height/halt_min_version. Refusing to restart."
+        else
+            verify_governance_halt || true
+        fi
+    fi
+
+    if (( HEIGHT == TARGET_HEIGHT )) && [[ "$CATCHING_UP" == "False" ]]; then
+        GOVERNANCE_CONFIRM_COUNT=0
+        if [[ "$HEIGHT" == "$LAST_HEIGHT" ]]; then
+            STABLE_COUNT=$((STABLE_COUNT + 1))
+        else
+            LAST_HEIGHT="$HEIGHT"
+            STABLE_COUNT=1
+        fi
+        log "Halt height confirmed: $HEIGHT; identical stable reading ${STABLE_COUNT}/5 ($RPC_SOURCE RPC)."
+        if (( STABLE_COUNT >= 5 )); then
+            verify_governance_halt || fail "Could not confirm on-chain halt_height/halt_min_version. Refusing to restart."
+            break
+        fi
+    elif (( HEIGHT > TARGET_HEIGHT )) && [[ "$CATCHING_UP" == "False" ]]; then
+        # Network has resumed beyond the halt: waiting for the old block to
+        # repeat is impossible, so require five repeated governance matches.
+        STABLE_COUNT=0
+        LAST_HEIGHT=""
+        GOVERNANCE_CONFIRM_COUNT=$((GOVERNANCE_CONFIRM_COUNT + 1))
+        log "Network is beyond halt height ($HEIGHT > $TARGET_HEIGHT); governance confirmation ${GOVERNANCE_CONFIRM_COUNT}/5 ($RPC_SOURCE RPC)."
+        if (( GOVERNANCE_CONFIRM_COUNT >= 5 )); then
+            break
+        fi
+    else
+        LAST_HEIGHT=""
+        STABLE_COUNT=0
+        GOVERNANCE_CONFIRM_COUNT=0
+        LOOP_COUNT=$((LOOP_COUNT + 1))
+        if (( LOOP_COUNT % 4 == 0 )); then
+            log "Waiting for halt height $TARGET_HEIGHT; current=$HEIGHT catching_up=$CATCHING_UP ($RPC_SOURCE RPC)."
+        fi
+    fi
+
+    sleep "$CHECK_INTERVAL"
+done
+
+# Final RPC + governance check before stopping the service.
+FINAL_FIELDS="$(rpc_fields || true)"
+[[ -n "$FINAL_FIELDS" ]] || fail "Local and official fallback RPC stopped responding before restart."
+IFS=$'\t' read -r FINAL_CHAIN FINAL_HEIGHT FINAL_CATCHING FINAL_BUILD <<< "$FINAL_FIELDS"
+[[ "$FINAL_CHAIN" == "gnoland-1" && "$FINAL_HEIGHT" =~ ^[0-9]+$ ]] || \
+    fail "Final pre-stop RPC check failed (chain=$FINAL_CHAIN height=$FINAL_HEIGHT)."
+(( FINAL_HEIGHT >= TARGET_HEIGHT )) || fail "Final pre-stop height $FINAL_HEIGHT is below target $TARGET_HEIGHT."
+[[ "$FINAL_CATCHING" == "False" ]] || fail "Final pre-stop RPC reports catching_up=$FINAL_CATCHING."
+verify_governance_halt || fail "Final governance halt/version check failed."
+
+log "Validated halt condition and governance parameters. Stopping $SERVICE_NAME..."
+systemctl stop "$SERVICE_NAME"
+if systemctl is-active --quiet "$SERVICE_NAME"; then
+    fail "Could not stop $SERVICE_NAME."
+fi
+
+mkdir -p "$BACKUP_DIR"
+chmod 0700 "$BACKUP_DIR"
+cp -a "$GNOLAND_BIN" "$BACKUP_DIR/gnoland.before"
+cp -a "$GNOKEY_BIN" "$BACKUP_DIR/gnokey.before"
+log "Old binaries backed up to $BACKUP_DIR"
+
+# Stage both replacements before moving either one into place.
+install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0755 "$STAGED_GNOLAND" "${GNOLAND_BIN}.new"
+install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0755 "$STAGED_GNOKEY" "${GNOKEY_BIN}.new"
+[[ "$(GNOROOT="$GNOROOT" "${GNOLAND_BIN}.new" version 2>&1)" == *"$TARGET_VERSION"* ]] || fail "Staged gnoland binary version mismatch."
+[[ "$(GNOROOT="$GNOROOT" "${GNOKEY_BIN}.new" version 2>&1)" == *"$TARGET_VERSION"* ]] || fail "Staged gnokey binary version mismatch."
+
+mv -f "${GNOLAND_BIN}.new" "$GNOLAND_BIN"
+mv -f "${GNOKEY_BIN}.new" "$GNOKEY_BIN"
+log "Installed $TARGET_VERSION binaries."
+
+# Disable before starting the new node so the watcher never re-runs on reboot.
+systemctl disable "$WATCHER_UNIT" >/dev/null 2>&1 || true
+systemctl start "$SERVICE_NAME"
+
+log "Waiting for systemd and RPC to confirm the new binary..."
+READY=0
+for _ in $(seq 1 60); do
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+        log "Node service is not active yet; recent node logs follow."
+        journalctl -u "$SERVICE_NAME" -n 40 --no-pager || true
+        sleep 5
+        continue
+    fi
+    FIELDS="$(rpc_fields_from "$RPC_URL" 2>/dev/null || true)"
+    if [[ -n "$FIELDS" ]]; then
+        IFS=$'\t' read -r CHAIN HEIGHT CATCHING_UP BUILD_VERSION <<< "$FIELDS"
+        if [[ "$CHAIN" == "gnoland-1" && "$BUILD_VERSION" == "$TARGET_VERSION" ]]; then
+            READY=1
+            log "RPC confirms build_version=$BUILD_VERSION at height=$HEIGHT catching_up=$CATCHING_UP"
+            break
+        fi
+    fi
+    sleep 5
+done
+
+if (( READY == 1 )); then
+    log "SUCCESS: $SERVICE_NAME is running with $TARGET_VERSION."
+    log "Backup: $BACKUP_DIR"
+    log "Blockchain data, genesis, config and validator secrets were not modified."
+else
+    log "WARNING: binaries were replaced and service start was requested, but RPC did not confirm $TARGET_VERSION within 5 minutes."
+    log "Inspect: journalctl -u $SERVICE_NAME -n 150 --no-pager"
+    journalctl -u "$SERVICE_NAME" -n 100 --no-pager || true
+    exit 1
+fi
+WATCHER
+    sudo chmod 0755 "$WATCHER_SCRIPT"
+    sudo chown root:root "$WATCHER_SCRIPT"
+
+    sudo tee "/etc/systemd/system/$WATCHER_UNIT" >/dev/null <<'UNIT'
+[Unit]
+Description=Wait for Gnoland mainnet halt and install prepared upgrade
+Wants=network-online.target
+After=network-online.target gnoland-mainnet.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/gnoland-mainnet-upgrade-watcher
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    sudo systemctl daemon-reload
+    if ! sudo systemd-analyze verify "/etc/systemd/system/$WATCHER_UNIT"; then
+        error "The generated watcher unit failed systemd validation."
+        press_enter
+        return
+    fi
+    sudo systemctl enable --now "$WATCHER_UNIT"
+
+    echo ""
+    success "Build completed and automatic halt watcher is active."
+    echo "  Target version : $TARGET_VERSION"
+    echo "  Halt height    : $TARGET_HEIGHT"
+    echo "  Current node   : still running with the old binary"
+    echo "  Watcher        : $WATCHER_UNIT"
+    echo "  Build files    : $BUILD_DIR"
+    echo "  Staged binary  : $STAGED_ROOT"
+    echo ""
+    echo "  Follow progress:"
+    echo "  sudo journalctl -u $WATCHER_UNIT -f"
+    echo ""
+    echo "  The watcher survives SSH disconnects and server reboot."
+    press_enter
+}
+
+update_watcher_status() {
+    banner
+    echo -e "  ${BOLD}[9] Update Watcher Status / Logs${NC}\n"
+    sudo systemctl status gnoland-mainnet-upgrade-watcher.service --no-pager -l || true
+    echo ""
+    echo "  Recent watcher logs:"
+    sudo journalctl -u gnoland-mainnet-upgrade-watcher.service -n 60 --no-pager || true
+    press_enter
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
